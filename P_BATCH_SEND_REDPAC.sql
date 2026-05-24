@@ -401,68 +401,110 @@ COMMENT ON COLUMN "EMALLUAT"."PRIVI_REDPACACT"."MEMBERNO" IS '商城会员号';
 
 
 
-CREATE OR REPLACE PROCEDURE P_BATCH_SEND_REDPAC(p_day IN NUMBER DEFAULT 30)
 -- ============================================================
--- 存储过程：P_BATCH_SEND_REDPAC
+-- 生产环境前置要求：以下索引必须在存储过程上线前创建
+-- 执行方式：以 DBA 账号在对应 Schema 下执行
+-- ============================================================
+
+-- P0 致命级 —— 缺少任何一个，百万级数据无法正常运行
+CREATE INDEX "EMALLUAT"."IDX_MEMBER_HOSTCUSTNO"     ON "EMALLUAT"."MEMBER"("HOSTCUSTNO");
+CREATE INDEX "EMALLUAT"."IDX_MYREDPAC_MEMBER_PAC"    ON "EMALLUAT"."MYREDPAC"("MEMBERNO", "PACID");
+CREATE INDEX "EMALLUAT"."IDX_MYREDPAC_PACID"         ON "EMALLUAT"."MYREDPAC"("PACID");
+CREATE INDEX "ZHJFUAT"."IDX_REDPACACT_HIS_DEDUP"     ON "ZHJFUAT"."BZ_DATA_REDPACACT_HIS"("CHANNELNO", "OTHERID", "OTHERACTNO");
+
+-- P1 重要级 —— 大幅提升写入和清理性能
+CREATE INDEX "EMALLUAT"."IDX_REDPACAPPLY_BATCHID"    ON "EMALLUAT"."REDPACAPPLY"("BATCHID");
+CREATE INDEX "EMALLUAT"."IDX_REDPACAPPLYDETAIL_BID"  ON "EMALLUAT"."REDPACAPPLYDETAIL"("BATCHID");
+CREATE INDEX "ZHJFUAT"."IDX_SENDING_CREATEDATE"      ON "ZHJFUAT"."BZ_DATA_REDPACACT_SENDING"("CREATEDATE");
+CREATE INDEX "ZHJFUAT"."IDX_SENDING_DEL"             ON "ZHJFUAT"."BZ_DATA_REDPACACT_SENDING"("HCNO", "REDID", "OTHERID");
+
+-- P2 建议级
+CREATE INDEX "EMALLUAT"."IDX_PRIVI_REDPAC_REDID"     ON "EMALLUAT"."PRIVI_REDPACACT"("REDID");
+
+
+-- ============================================================
+-- 存储过程：P_BATCH_SEND_REDPAC（重构版 v2）
 -- 功能：批量送红包
--- 业务逻辑：
--- 1. 从临时表和待送表获取待处理数据
--- 2. 按以下步骤过滤：
---    a) 过滤客户不存在的记录，写入BZ_DATA_REDPACACT_HIS和PRIVI_REDPACACT
---    b) 过滤无效红包（不存在/未审核/已过期等）,除不存在的其他其他情况都写入PRIVI_REDPACACT
---    c) 过滤超出个人限制的记录
---    d) 过滤超出红包总数限制的记录
--- 3. 将符合条件的记录写入商城库
--- 4. 记录处理结果到历史表
---    a) 存在的跳过不做处理
---    b) 不存在的插入
--- 5. 清理待送红包表超过p_day天的数据
+--
+-- 【相比 v1 的核心变更】
+-- 1. 修复 TO_CHAR 格式掩码 mm→mi（原版将月份写入分钟字段，导致时间比较和记录错误）
+-- 2. 预聚合 MYREDPAC 统计替代逐行关联子查询（500万行从 1000万次索引查找 → 2次 GROUP BY）
+-- 3. REDPACAPPLY 直接写入正确 SUCCCOUNT/FAILCOUNT，去掉 INSERT-then-UPDATE 反模式
+-- 4. REDPACAPPLYDETAIL 直接写入 STATUS='2'，去掉 INSERT('3')-then-UPDATE('2') 反模式
+-- 5. 去掉了 temp_final_ok 空表创建再 INSERT 的冗余步骤
+-- 6. GTT 清理统一到异常处理块
+--
+-- 【业务逻辑（与原版一致）】
+-- a) 过滤客户不存在的记录 → HIS(0) + PRIVI_REDPACACT
+-- b) 过滤无效红包 → HIS(2) + PRIVI_REDPACACT
+-- c) 过滤超出个人限制 → HIS(3) + SENDING 重试
+-- d) 过滤超出红包总数限制 → HIS(4) + SENDING 重试
+-- e) 成功记录 → MYREDPAC + REDPACAPPLY + REDPACAPPLYDETAIL + HIS(1)
+-- f) 清理已成功的 SENDING 记录 + 过期数据
+--
+-- 参数：
+--   p_day : 清理超过 p_day 天的待送表历史，0 表示清空整个待送表
 -- ============================================================
+CREATE OR REPLACE PROCEDURE P_BATCH_SEND_REDPAC(p_day IN NUMBER DEFAULT 30)
 IS
-    v_now     VARCHAR2(14);  -- 时间戳
-    v_now1     VARCHAR2(20);  -- 送红包明细表时间
-    v_now2     VARCHAR2(20);  -- 我的红包创建时间
-    v_now3     VARCHAR2(20);  -- 处理时间经过
-    v_today   VARCHAR2(8); 
-    v_batchid VARCHAR2(16); -- 批次号
-    v_cnt     NUMBER;  -- 数据数量
-     --账务日期
-    l_accdate varchar2(8);
-    v_sql varchar2(32767);
-    v_errorInfo varchar2(2000) default '';
-    
-    -- 各类数据处理计数（替代PL/SQL集合，数据全程留在GTT中）
-    v_final_ok_count      NUMBER := 0;
-    v_invalid_pac_count   NUMBER := 0;
-    v_limit_fail_count    NUMBER := 0;
-    v_maxsend_fail_count  NUMBER := 0;
-    v_no_member_count     NUMBER := 0;
+    -- 时间变量（FIXED: TO_CHAR 中 mm 改为 mi，mm 在 Oracle 中表示月份而非分钟）
+    v_now       VARCHAR2(14);  -- 时间戳
+    v_now1      VARCHAR2(19);   -- 送红包明细表时间 YYYY-MM-DD HH24:MI:SS
+    v_now2      VARCHAR2(19);   -- 我的红包创建时间 YYYYMMDD HH24:MI:SS
+    v_today     VARCHAR2(8);  -- 处理时间经过
+    v_batchid   VARCHAR2(20);-- 批次号
+    l_accdate   VARCHAR2(8);
+
+    -- 源数据总量
+    v_total_source    NUMBER := 0;
+
+    -- 各类处理计数
+    v_no_member_cnt   NUMBER := 0;
+    v_invalid_pac_cnt NUMBER := 0;
+    v_over_limit_cnt  NUMBER := 0;
+    v_over_max_cnt    NUMBER := 0;
+    v_success_cnt     NUMBER := 0;
+
+    -- 异常处理
+    v_error_info      VARCHAR2(4000);
+
+    -- 安全删除临时表
+    PROCEDURE safe_drop(p_table IN VARCHAR2) IS
+    BEGIN
+        EXECUTE IMMEDIATE 'DROP TABLE ' || p_table;
+    EXCEPTION
+        WHEN OTHERS THEN NULL;
+    END;
 
 BEGIN
-    /** OB库有超时限制，增加超时时长 **/
+    -- =================================================================
+    -- 阶段1：初始化
+    -- =================================================================
     EXECUTE IMMEDIATE 'SET ob_query_timeout = 86400000000';
-    -- 步骤1：初始化变量
+
     v_now     := TO_CHAR(SYSDATE, 'YYYYMMDDHH24MISS');
-    v_now1     := TO_CHAR(SYSDATE, 'YYYY-MM-DD hh24:mm:ss');
-    v_now2     := TO_CHAR(SYSDATE, 'YYYYMMDD hh24:mm:ss');
-    v_now3     := TO_CHAR(SYSDATE, 'YYYYMMDD hh24:mm:ss');
+    v_now1    := TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS');   -- FIXED: mm→mi
+    v_now2    := TO_CHAR(SYSDATE, 'YYYYMMDD HH24:MI:SS');     -- FIXED: mm→mi
     v_today   := TO_CHAR(SYSDATE, 'YYYYMMDD');
     v_batchid := 'P' || v_now;
-    DBMS_OUTPUT.PUT_LINE('处理开始时间：' || v_now3);
-    select sp.sysworkdate into l_accdate from sysparameter sp;
 
-    /* ================== 步骤2：检查是否有待处理数据 ================== */
-    SELECT COUNT(1)
-      INTO v_cnt
-      FROM (
-            SELECT 1 FROM ZHJFUAT.QS_TEMP_BZ_DATA_REDPACACT
-            UNION ALL
-            SELECT 1 FROM ZHJFUAT.BZ_DATA_REDPACACT_SENDING
-           );
+    SELECT sp.sysworkdate INTO l_accdate FROM sysparameter sp;
 
-    IF v_cnt = 0 THEN
-        DBMS_OUTPUT.PUT_LINE('没有待处理的红包数据');
-        -- 清理数据：p_day=0 时清空整个待送表，p_day>0 时清理超过p_day天的数据
+    DBMS_OUTPUT.PUT_LINE('[P_BATCH_SEND_REDPAC] 开始 | 批次: ' || v_batchid
+                      || ' | 时间: ' || TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS'));
+
+    -- =================================================================
+    -- 阶段2：检查待处理数据
+    -- =================================================================
+    SELECT COUNT(1) INTO v_total_source
+    FROM (
+        SELECT 1 FROM ZHJFUAT.QS_TEMP_BZ_DATA_REDPACACT WHERE ROWNUM = 1
+        UNION ALL
+        SELECT 1 FROM ZHJFUAT.BZ_DATA_REDPACACT_SENDING WHERE ROWNUM = 1
+    );
+
+    IF v_total_source = 0 THEN
+        DBMS_OUTPUT.PUT_LINE('[P_BATCH_SEND_REDPAC] 无待处理数据');
         IF p_day = 0 THEN
             EXECUTE IMMEDIATE 'TRUNCATE TABLE ZHJFUAT.BZ_DATA_REDPACACT_SENDING';
         ELSE
@@ -473,49 +515,91 @@ BEGIN
         RETURN;
     END IF;
 
-    /* ================== 步骤3：识别客户不存在的记录（写入GTT替代PL/SQL集合） ================== */
-    BEGIN
-        EXECUTE IMMEDIATE 'DROP TABLE temp_no_member';
-    EXCEPTION
-        WHEN OTHERS THEN NULL;
-    END;
+    -- =================================================================
+    -- 阶段3：预聚合 MYREDPAC 统计数据（替代逐行关联子查询的核心优化）
+    -- 一次 GROUP BY 替代 N×2 次关联子查询
+    -- =================================================================
+    safe_drop('tmp_member_rp_stats');
 
     EXECUTE IMMEDIATE '
-        CREATE GLOBAL TEMPORARY TABLE temp_no_member ON COMMIT PRESERVE ROWS AS
-        SELECT HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO, OTHERACTNO, DATATYPE
+        CREATE GLOBAL TEMPORARY TABLE tmp_member_rp_stats ON COMMIT PRESERVE ROWS AS
+        SELECT MEMBERNO, PACID, COUNT(*) AS sent_cnt
+        FROM EMALLUAT.MYREDPAC
+        GROUP BY MEMBERNO, PACID';
+
+    safe_drop('tmp_pac_total_stats');
+
+    EXECUTE IMMEDIATE '
+        CREATE GLOBAL TEMPORARY TABLE tmp_pac_total_stats ON COMMIT PRESERVE ROWS AS
+        SELECT PACID, COUNT(*) AS total_sent
+        FROM EMALLUAT.MYREDPAC
+        GROUP BY PACID';
+
+    -- =================================================================
+    -- 阶段4：构建统一源数据 + 客户验证 + 红包验证（一次扫描完成三类判断）
+    -- =================================================================
+    safe_drop('tmp_source');
+
+    EXECUTE IMMEDIATE '
+        CREATE GLOBAL TEMPORARY TABLE tmp_source ON COMMIT PRESERVE ROWS AS
+        SELECT
+            src.HCNO,
+            src.REDID,
+            src.OTHERDESC,
+            src.OTHERID,
+            src.CHANNELNO,
+            src.OTHERACTNO,
+            src.DATATYPE,
+            m.MEMBERNO,
+            CASE WHEN m.MEMBERNO IS NULL THEN ''N'' ELSE ''Y'' END AS has_member,
+            r.PACID              AS r_pacid,
+            NVL(r.PACAMTMIN, 0)  AS pac_amt,
+            NVL(r.LIMITCOUNT, 0) AS limit_cnt,
+            NVL(r.MAXSEND, 0)    AS max_send,
+            CASE
+                WHEN r.PACID IS NULL     THEN ''PAC_NOT_EXIST''
+                WHEN r.AUTHSTATE != ''1002'' THEN ''AUTH_FAIL''
+                WHEN r.STATE != ''00''       THEN ''DISABLED''
+                WHEN NVL(r.USEENDTIME, ''9999-12-31 23:59:59'') < ''' || v_now1 || ''' THEN ''EXPIRED''
+                ELSE ''VALID''
+            END AS pac_status
         FROM (
             SELECT HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO, OTHERACTNO, 0 AS DATATYPE
-              FROM ZHJFUAT.QS_TEMP_BZ_DATA_REDPACACT
+            FROM ZHJFUAT.QS_TEMP_BZ_DATA_REDPACACT
             UNION ALL
             SELECT HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO, OTHERACTNO, 1 AS DATATYPE
-              FROM ZHJFUAT.BZ_DATA_REDPACACT_SENDING
-        ) s
-        WHERE NOT EXISTS (
-            SELECT 1 FROM EMALLUAT.MEMBER m WHERE m.HOSTCUSTNO = s.HCNO
-        )';
+            FROM ZHJFUAT.BZ_DATA_REDPACACT_SENDING
+        ) src
+        LEFT JOIN EMALLUAT.MEMBER m ON m.HOSTCUSTNO = src.HCNO
+        LEFT JOIN EMALLUAT.REDPACACT r ON r.PACID = src.REDID';
 
-    EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM temp_no_member' INTO v_no_member_count;
+    -- 统计源数据总量
+    SELECT COUNT(1) INTO v_total_source FROM tmp_source;
 
-    /* ================== 步骤4：处理客户不存在的记录 ================== */
-    IF v_no_member_count > 0 THEN
-        -- ① 写入待送表（仅临时表来源数据）
+    -- =================================================================
+    -- 阶段5：处理客户不存在的记录
+    -- =================================================================
+    SELECT COUNT(1) INTO v_no_member_cnt FROM tmp_source WHERE has_member = 'N';
+
+    IF v_no_member_cnt > 0 THEN
+        -- 写入 SENDING（仅 DATATYPE=0，即 QS_TEMP 来源）
         EXECUTE IMMEDIATE '
             INSERT INTO ZHJFUAT.BZ_DATA_REDPACACT_SENDING
             (HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO, OTHERACTNO, DATADATE, CREATEDATE)
             SELECT HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO, OTHERACTNO,
                    ''' || l_accdate || ''', ''' || v_today || '''
-            FROM temp_no_member WHERE DATATYPE = 0';
+            FROM tmp_source WHERE has_member = ''N'' AND DATATYPE = 0';
 
-        -- ② 写入历史表（客户不存在）
+        -- 写入 HIS（SENDSTATUS=0，仅 DATATYPE=0）
         EXECUTE IMMEDIATE '
             INSERT INTO ZHJFUAT.BZ_DATA_REDPACACT_HIS
             (HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO, OTHERACTNO,
              SENDSTATUS, DATADATE, CREATEDATE)
             SELECT HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO, OTHERACTNO,
                    ''0'', ''' || l_accdate || ''', ''' || v_today || '''
-            FROM temp_no_member WHERE DATATYPE = 0';
+            FROM tmp_source WHERE has_member = ''N'' AND DATATYPE = 0';
 
-        -- ③ 写入EMALLUAT待送红包表（仅REDID在REDPACACT中存在的记录）
+        -- 写入 PRIVI_REDPACACT（仅 DATATYPE=0 且 REDID 在 REDPACACT 中存在）
         EXECUTE IMMEDIATE '
             INSERT INTO EMALLUAT.PRIVI_REDPACACT
             (ID, CUSTTYPE, CUSTNO, REDID, OTHERDESC, OTHERID, CHANNELNO,
@@ -523,149 +607,95 @@ BEGIN
             SELECT EMALLUAT.S_PRIVI_REDPACACT.NEXTVAL,
                    ''HCNO'', HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO,
                    1, OTHERACTNO, ''' || v_today || ''', 0
-            FROM temp_no_member
-            WHERE DATATYPE = 0
-              AND EXISTS (SELECT 1 FROM EMALLUAT.REDPACACT r WHERE r.PACID = REDID)';
+            FROM tmp_source
+            WHERE has_member = ''N'' AND DATATYPE = 0
+              AND r_pacid IS NOT NULL';
     END IF;
 
-    -- 清理客户不存在临时表
-    BEGIN
-        EXECUTE IMMEDIATE 'DROP TABLE temp_no_member';
-    EXCEPTION
-        WHEN OTHERS THEN NULL;
-    END;
+    -- =================================================================
+    -- 阶段6：对有效红包 + 有效客户的记录，计算个人限制和总量限制
+    -- 使用预聚合的 MYREDPAC 统计数据 JOIN，替代逐行关联子查询
+    -- =================================================================
+    safe_drop('tmp_limit_checked');
 
-    /* ================== 步骤5：核心业务逻辑 - 红包发放处理 ================== */
-    -- 创建全局临时表来存储中间结果
-    BEGIN
-        EXECUTE IMMEDIATE 'DROP TABLE temp_with_redpac';
-    EXCEPTION
-        WHEN OTHERS THEN NULL;
-    END;
-
-    EXECUTE IMMEDIATE 'CREATE GLOBAL TEMPORARY TABLE temp_with_redpac ON COMMIT PRESERVE ROWS AS
-        SELECT HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO, OTHERACTNO, 
-               DATATYPE, MEMBERNO, PACAMTMIN, LIMITCOUNT, MAXSEND,
-               CASE 
-                 WHEN PACID IS NULL THEN ''N''  -- 红包不存在
-                 WHEN AUTHSTATE != ''1002'' THEN ''N''  -- 审核未通过
-                 WHEN STATE != ''00'' THEN ''N''  -- 红包未启用
-                 WHEN NVL(USEENDTIME, ''9999-12-31 23:59:59'') < ''' || v_now1 || ''' THEN ''N''  -- 已过期
-                 ELSE ''Y''
-               END AS IS_VALID
-        FROM (
-            SELECT wm.HCNO, wm.REDID, wm.OTHERDESC, wm.OTHERID, wm.CHANNELNO, wm.OTHERACTNO, 
-                   wm.DATATYPE, wm.MEMBERNO, r.PACAMTMIN, r.LIMITCOUNT, r.MAXSEND,
-                   r.PACID, r.AUTHSTATE, r.STATE, r.USEENDTIME
-            FROM (
-                SELECT s.HCNO, s.REDID, s.OTHERDESC, s.OTHERID, s.CHANNELNO, s.OTHERACTNO, 
-                       s.DATATYPE, m.MEMBERNO
-                FROM (
-                    SELECT HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO, OTHERACTNO, 
-                           0 AS DATATYPE
-                    FROM ZHJFUAT.QS_TEMP_BZ_DATA_REDPACACT
-                    UNION ALL
-                    SELECT HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO, OTHERACTNO,
-                           1 AS DATATYPE
-                    FROM ZHJFUAT.BZ_DATA_REDPACACT_SENDING
-                ) s
-                JOIN EMALLUAT.MEMBER m ON m.HOSTCUSTNO = s.HCNO
-            ) wm
-            LEFT JOIN EMALLUAT.REDPACACT r ON r.PACID = wm.REDID
-        )';
-
-    -- 计算已发送红包数量并存储到另一个临时表
-    BEGIN
-        EXECUTE IMMEDIATE 'DROP TABLE temp_sent_counts';
-    EXCEPTION
-        WHEN OTHERS THEN NULL;
-    END;
-
-    EXECUTE IMMEDIATE 'CREATE GLOBAL TEMPORARY TABLE temp_sent_counts ON COMMIT PRESERVE ROWS AS
-        WITH member_ranked AS (
-            SELECT wr.*,
-                   (SELECT COUNT(1)
-                      FROM EMALLUAT.MYREDPAC m
-                     WHERE m.MEMBERNO = wr.MEMBERNO
-                       AND m.PACID = wr.REDID) AS SENT_BY_MEMBER,
-                   ROW_NUMBER() OVER(
-                       PARTITION BY wr.MEMBERNO, wr.REDID
-                       ORDER BY wr.OTHERID
-                   ) AS RN_MEMBER_RED
-            FROM temp_with_redpac wr
-            WHERE wr.IS_VALID = ''Y''
-        ),
-        limit_ok AS (
-            SELECT mr.*
-            FROM member_ranked mr
-            WHERE mr.RN_MEMBER_RED + mr.SENT_BY_MEMBER <= mr.LIMITCOUNT
+    EXECUTE IMMEDIATE '
+        CREATE GLOBAL TEMPORARY TABLE tmp_limit_checked ON COMMIT PRESERVE ROWS AS
+        WITH personal_check AS (
+            SELECT
+                t.HCNO, t.REDID, t.OTHERDESC, t.OTHERID, t.CHANNELNO, t.OTHERACTNO,
+                t.DATATYPE, t.MEMBERNO, t.pac_amt, t.limit_cnt, t.max_send,
+                NVL(s.sent_cnt, 0) AS sent_by_member,
+                ROW_NUMBER() OVER(PARTITION BY t.MEMBERNO, t.REDID ORDER BY t.OTHERID) AS rn_member,
+                CASE
+                    WHEN NVL(s.sent_cnt, 0) + ROW_NUMBER() OVER(PARTITION BY t.MEMBERNO, t.REDID ORDER BY t.OTHERID)
+                         <= t.limit_cnt THEN ''Y''
+                    ELSE ''N''
+                END AS personal_ok
+            FROM tmp_source t
+            LEFT JOIN tmp_member_rp_stats s ON s.MEMBERNO = t.MEMBERNO AND s.PACID = t.REDID
+            WHERE t.has_member = ''Y''
+              AND t.pac_status = ''VALID''
         )
-        SELECT lo.*,
-               (SELECT COUNT(1)
-                  FROM EMALLUAT.MYREDPAC m
-                 WHERE m.PACID = lo.REDID) AS SENT_TOTAL,
-               ROW_NUMBER() OVER(
-                   PARTITION BY lo.REDID
-                   ORDER BY lo.OTHERID
-               ) AS RN_RED
-        FROM limit_ok lo';
+        SELECT
+            pc.*,
+            NVL(pt.total_sent, 0) AS sent_total,
+            ROW_NUMBER() OVER(PARTITION BY pc.REDID ORDER BY pc.OTHERID) AS rn_total,
+            CASE
+                WHEN NVL(pt.total_sent, 0) + ROW_NUMBER() OVER(PARTITION BY pc.REDID ORDER BY pc.OTHERID)
+                     <= pc.max_send THEN ''Y''
+                ELSE ''N''
+            END AS total_ok
+        FROM personal_check pc
+        LEFT JOIN tmp_pac_total_stats pt ON pt.PACID = pc.REDID';
 
-    /* ================== 步骤5.1：统计各类数据计数 ================== */
-    EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM temp_with_redpac WHERE IS_VALID = ''N'''
-        INTO v_invalid_pac_count;
+    -- 统计各类结果
+    SELECT COUNT(1) INTO v_success_cnt
+    FROM tmp_limit_checked WHERE personal_ok = 'Y' AND total_ok = 'Y';
 
-    EXECUTE IMMEDIATE '
-        SELECT COUNT(*)
-        FROM temp_with_redpac wr
-        WHERE wr.IS_VALID = ''Y''
-          AND NOT EXISTS (SELECT 1 FROM temp_sent_counts sc
-                           WHERE sc.HCNO = wr.HCNO
-                             AND sc.REDID = wr.REDID
-                             AND sc.OTHERID = wr.OTHERID)'
-        INTO v_limit_fail_count;
+    SELECT COUNT(1) INTO v_over_limit_cnt
+    FROM tmp_limit_checked WHERE personal_ok = 'N';
 
-    EXECUTE IMMEDIATE '
-        SELECT COUNT(*)
-        FROM temp_sent_counts sc
-        WHERE sc.RN_MEMBER_RED + sc.SENT_BY_MEMBER <= sc.LIMITCOUNT
-          AND sc.RN_RED + sc.SENT_TOTAL > sc.MAXSEND'
-        INTO v_maxsend_fail_count;
+    SELECT COUNT(1) INTO v_over_max_cnt
+    FROM tmp_limit_checked WHERE personal_ok = 'Y' AND total_ok = 'N';
 
-    /* ================== 步骤6：写历史记录/待送表（纯SQL批量写入） ================== */
-    -- 无效红包记录（IS_VALID='N'）
-    IF v_invalid_pac_count > 0 THEN
+    SELECT COUNT(1) INTO v_invalid_pac_cnt
+    FROM tmp_source WHERE has_member = 'Y' AND pac_status != 'VALID';
+
+    -- =================================================================
+    -- 阶段7：写入各类失败记录
+    -- =================================================================
+
+    -- 7.1 无效红包 → HIS(2) + PRIVI_REDPACACT（仅 DATATYPE=0）
+    IF v_invalid_pac_cnt > 0 THEN
         EXECUTE IMMEDIATE '
             INSERT INTO ZHJFUAT.BZ_DATA_REDPACACT_HIS
             (HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO, OTHERACTNO,
              SENDSTATUS, DATADATE, CREATEDATE)
             SELECT HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO, OTHERACTNO,
                    ''2'', ''' || l_accdate || ''', ''' || v_today || '''
-            FROM temp_with_redpac WHERE IS_VALID = ''N'' AND DATATYPE = 0';
+            FROM tmp_source
+            WHERE has_member = ''Y'' AND pac_status != ''VALID'' AND DATATYPE = 0';
 
         EXECUTE IMMEDIATE '
             INSERT INTO EMALLUAT.PRIVI_REDPACACT
             (ID, CUSTTYPE, CUSTNO, REDID, OTHERDESC, OTHERID, CHANNELNO,
              DATASOURCE, OTHERACTNO, CREATEDATE, STATUS, MEMBERNO)
-            SELECT EMALLUAT.S_PRIVI_REDPACACT.NEXTVAL, ''HCNO'', HCNO, REDID,
-                   OTHERDESC, OTHERID, CHANNELNO, 1, OTHERACTNO, ''' || v_today || ''', 0, MEMBERNO
-            FROM temp_with_redpac
-            WHERE IS_VALID = ''N'' AND DATATYPE = 0
-              AND EXISTS (SELECT 1 FROM EMALLUAT.REDPACACT r WHERE r.PACID = REDID)';
+            SELECT EMALLUAT.S_PRIVI_REDPACACT.NEXTVAL,
+                   ''HCNO'', HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO,
+                   1, OTHERACTNO, ''' || v_today || ''', 0, MEMBERNO
+            FROM tmp_source
+            WHERE has_member = ''Y'' AND pac_status != ''VALID'' AND DATATYPE = 0
+              AND r_pacid IS NOT NULL';
     END IF;
 
-    -- 超出个人限制的记录（temp_with_redpac中有但temp_sent_counts中无的行）
-    IF v_limit_fail_count > 0 THEN
+    -- 7.2 超出个人限制 → HIS(3) + SENDING 重试（仅 DATATYPE=0）
+    IF v_over_limit_cnt > 0 THEN
         EXECUTE IMMEDIATE '
             INSERT INTO ZHJFUAT.BZ_DATA_REDPACACT_SENDING
             (HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO, OTHERACTNO, DATADATE, CREATEDATE)
             SELECT HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO, OTHERACTNO,
                    ''' || l_accdate || ''', ''' || v_today || '''
-            FROM temp_with_redpac wr
-            WHERE wr.IS_VALID = ''Y'' AND wr.DATATYPE = 0
-              AND NOT EXISTS (SELECT 1 FROM temp_sent_counts sc
-                               WHERE sc.HCNO = wr.HCNO
-                                 AND sc.REDID = wr.REDID
-                                 AND sc.OTHERID = wr.OTHERID)';
+            FROM tmp_limit_checked WHERE personal_ok = ''N'' AND DATATYPE = 0';
 
         EXECUTE IMMEDIATE '
             INSERT INTO ZHJFUAT.BZ_DATA_REDPACACT_HIS
@@ -673,24 +703,18 @@ BEGIN
              SENDSTATUS, DATADATE, CREATEDATE)
             SELECT HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO, OTHERACTNO,
                    ''3'', ''' || l_accdate || ''', ''' || v_today || '''
-            FROM temp_with_redpac wr
-            WHERE wr.IS_VALID = ''Y'' AND wr.DATATYPE = 0
-              AND NOT EXISTS (SELECT 1 FROM temp_sent_counts sc
-                               WHERE sc.HCNO = wr.HCNO
-                                 AND sc.REDID = wr.REDID
-                                 AND sc.OTHERID = wr.OTHERID)';
+            FROM tmp_limit_checked WHERE personal_ok = ''N'' AND DATATYPE = 0';
     END IF;
 
-    -- 超出红包总数限制的记录
-    IF v_maxsend_fail_count > 0 THEN
+    -- 7.3 超出红包总量限制 → HIS(4) + SENDING 重试（仅 DATATYPE=0）
+    IF v_over_max_cnt > 0 THEN
         EXECUTE IMMEDIATE '
             INSERT INTO ZHJFUAT.BZ_DATA_REDPACACT_SENDING
             (HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO, OTHERACTNO, DATADATE, CREATEDATE)
             SELECT HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO, OTHERACTNO,
                    ''' || l_accdate || ''', ''' || v_today || '''
-            FROM temp_sent_counts sc
-            WHERE sc.RN_MEMBER_RED + sc.SENT_BY_MEMBER <= sc.LIMITCOUNT
-              AND sc.RN_RED + sc.SENT_TOTAL > sc.MAXSEND AND sc.DATATYPE = 0';
+            FROM tmp_limit_checked
+            WHERE personal_ok = ''Y'' AND total_ok = ''N'' AND DATATYPE = 0';
 
         EXECUTE IMMEDIATE '
             INSERT INTO ZHJFUAT.BZ_DATA_REDPACACT_HIS
@@ -698,222 +722,153 @@ BEGIN
              SENDSTATUS, DATADATE, CREATEDATE)
             SELECT HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO, OTHERACTNO,
                    ''4'', ''' || l_accdate || ''', ''' || v_today || '''
-            FROM temp_sent_counts sc
-            WHERE sc.RN_MEMBER_RED + sc.SENT_BY_MEMBER <= sc.LIMITCOUNT
-              AND sc.RN_RED + sc.SENT_TOTAL > sc.MAXSEND AND sc.DATATYPE = 0';
+            FROM tmp_limit_checked
+            WHERE personal_ok = ''Y'' AND total_ok = ''N'' AND DATATYPE = 0';
     END IF;
 
-    /* ================== 步骤7：发送红包到商城系统 ================== */
-    -- 先统计成功数据量
-    EXECUTE IMMEDIATE '
-        SELECT COUNT(*)
-        FROM temp_sent_counts sc
-        WHERE sc.RN_MEMBER_RED + sc.SENT_BY_MEMBER <= sc.LIMITCOUNT
-          AND sc.RN_RED + sc.SENT_TOTAL <= sc.MAXSEND'
-        INTO v_final_ok_count;
+    -- =================================================================
+    -- 阶段8：写入成功记录（单事务，保证原子性）
+    -- =================================================================
+    IF v_success_cnt > 0 THEN
 
-    IF v_final_ok_count > 0 THEN
-        -- 创建扩容的temp_final_ok（含MEMBERNO/PACAMTMIN/DATATYPE）
-        BEGIN
-            EXECUTE IMMEDIATE 'DROP TABLE temp_final_ok';
-        EXCEPTION
-            WHEN OTHERS THEN NULL;
-        END;
-
-        EXECUTE IMMEDIATE '
-            CREATE GLOBAL TEMPORARY TABLE temp_final_ok ON COMMIT PRESERVE ROWS AS
-            SELECT HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO, OTHERACTNO,
-                   CAST(NULL AS VARCHAR2(8)) AS DATADATE,
-                   CAST(NULL AS VARCHAR2(8)) AS CREATEDATE,
-                   MEMBERNO, PACAMTMIN, DATATYPE
-            FROM temp_sent_counts WHERE 1=0';
-
-        -- ★ 一次INSERT替代 BULK COLLECT + FOR LOOP EXECUTE IMMEDIATE
-        EXECUTE IMMEDIATE '
-            INSERT INTO temp_final_ok
-            SELECT HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO, OTHERACTNO,
-                   ''' || l_accdate || ''', ''' || v_today || ''', MEMBERNO, PACAMTMIN, DATATYPE
-            FROM temp_sent_counts sc
-            WHERE sc.RN_MEMBER_RED + sc.SENT_BY_MEMBER <= sc.LIMITCOUNT
-              AND sc.RN_RED + sc.SENT_TOTAL <= sc.MAXSEND';
-
-        -- 7.1 写REDPACAPPLY表（按REDID+CHANNELNO+OTHERDESC+OTHERACTNO分组）
+        -- 8.1 REDPACAPPLY：直接写入正确的 SUCCCOUNT/FAILCOUNT（去掉了 INSERT-then-UPDATE）
         EXECUTE IMMEDIATE '
             INSERT INTO EMALLUAT.REDPACAPPLY
-            (ID, BATCHID, APPLYBY, APPLYTIME, SUMCOUNT, SUCCCOUNT,
-             FAILCOUNT, PACID, TYPE, SENDREASON, SENDACTNO)
+            (ID, BATCHID, APPLYBY, APPLYTIME, SUMCOUNT, SUCCCOUNT, FAILCOUNT, PACID, TYPE, SENDREASON, SENDACTNO)
             SELECT EMALLUAT.S_REDPACAPPLY.NEXTVAL,
-                   BATCHID,
+                   ''' || v_batchid || ''',
                    CHANNELNO,
-                   APPLYTIME,
-                   SUMCOUNT,
-                   SUCCCOUNT,
-                   FAILCOUNT,
+                   ''' || v_now1 || ''',
+                   cnt, cnt, 0,
                    REDID,
-                   TYPE,
+                   ''4'',
                    OTHERDESC,
                    OTHERACTNO
-              FROM (
-                    SELECT ''' || v_batchid || ''' AS BATCHID,
-                           CHANNELNO,
-                           ''' || v_now1 || ''' AS APPLYTIME,
-                           COUNT(*) AS SUMCOUNT,
-                           0 AS SUCCCOUNT,
-                           COUNT(*) AS FAILCOUNT,
-                           REDID,
-                           ''4'' AS TYPE,
-                           OTHERDESC,
-                           OTHERACTNO
-                      FROM temp_final_ok
-                     GROUP BY REDID, CHANNELNO, OTHERDESC, OTHERACTNO
-                   )';
+            FROM (
+                SELECT REDID, CHANNELNO, OTHERDESC, OTHERACTNO, COUNT(*) AS cnt
+                FROM tmp_limit_checked
+                WHERE personal_ok = ''Y'' AND total_ok = ''Y''
+                GROUP BY REDID, CHANNELNO, OTHERDESC, OTHERACTNO
+            )';
 
-        -- 7.2 写REDPACAPPLYDETAIL表（★ 一条INSERT...SELECT替代FORALL）
+        -- 8.2 REDPACAPPLYDETAIL：直接写入 STATUS='2'（去掉了 INSERT('3')-then-UPDATE('2')）
         EXECUTE IMMEDIATE '
             INSERT INTO EMALLUAT.REDPACAPPLYDETAIL
             (ID, PHONENO, BATCHID, MEMBERNO, EMAIL, CREATETIME, STATUS, CUSTNO)
             SELECT EMALLUAT.S_REDPACAPPLYDETAIL.NEXTVAL,
-                   NULL, ''' || v_batchid || ''', 0, NULL, ''' || v_now1 || ''', ''3'', HCNO
-            FROM temp_final_ok';
+                   NULL,
+                   ''' || v_batchid || ''',
+                   MEMBERNO,
+                   NULL,
+                   ''' || v_now1 || ''',
+                   ''2'',
+                   HCNO
+            FROM tmp_limit_checked
+            WHERE personal_ok = ''Y'' AND total_ok = ''Y''';
 
-        -- 7.3 写MYREDPAC表（★ 一条INSERT...SELECT替代FORALL）
+        -- 8.3 MYREDPAC：写入用户红包
         EXECUTE IMMEDIATE '
             INSERT INTO EMALLUAT.MYREDPAC
-            (MYPACID, MEMBERNO, PACID, PACSTATE, INITAMT,
-             BELONGTYPE, CREATETIME, RECORDID, REFUNDTIMES)
+            (MYPACID, MEMBERNO, PACID, PACSTATE, INITAMT, BELONGTYPE, CREATETIME, RECORDID, REFUNDTIMES)
             SELECT EMALLUAT.S_MYREDPAC.NEXTVAL,
-                   MEMBERNO, REDID, ''1002'', PACAMTMIN,
-                   ''1001'', ''' || v_now2 || ''', NULL, 0
-            FROM temp_final_ok';
+                   MEMBERNO,
+                   REDID,
+                   ''1002'',
+                   pac_amt,
+                   ''1001'',
+                   ''' || v_now2 || ''',
+                   NULL,
+                   0
+            FROM tmp_limit_checked
+            WHERE personal_ok = ''Y'' AND total_ok = ''Y''';
 
-        -- 7.4 更新REDPACAPPLY表（按分组匹配更新成功数量）
-        EXECUTE IMMEDIATE '
-            UPDATE EMALLUAT.REDPACAPPLY ra
-               SET (SUCCCOUNT, FAILCOUNT) = (
-                       SELECT COUNT(*), 0
-                         FROM temp_final_ok t
-                        WHERE t.REDID = ra.PACID
-                          AND t.CHANNELNO = ra.APPLYBY
-                          AND t.OTHERDESC = ra.SENDREASON
-                          AND t.OTHERACTNO = ra.SENDACTNO
-                   )
-             WHERE ra.BATCHID = ''' || v_batchid || '''';
-
-        -- 7.5 更新REDPACAPPLYDETAIL表（更新状态和会员号）
-        UPDATE EMALLUAT.REDPACAPPLYDETAIL d
-           SET STATUS = '2',  -- 成功状态
-               MEMBERNO = (
-                   SELECT MIN(m.MEMBERNO)
-                     FROM EMALLUAT.MEMBER m
-                    WHERE m.HOSTCUSTNO = d.CUSTNO
-               )
-         WHERE d.BATCHID = v_batchid;
-
-        -- 7.6 写成功记录到历史表（仅插入不存在的，已存在的跳过）
+        -- 8.4 HIS：成功记录（NOT EXISTS 去重，按 CHANNELNO+OTHERID+OTHERACTNO）
         EXECUTE IMMEDIATE '
             INSERT INTO ZHJFUAT.BZ_DATA_REDPACACT_HIS
-                (HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO,
-                 OTHERACTNO, SENDSTATUS, DATADATE, CREATEDATE)
-            SELECT HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO,
-                   OTHERACTNO, ''1'', DATADATE, CREATEDATE
-              FROM temp_final_ok src
-             WHERE NOT EXISTS (
-                       SELECT 1 FROM ZHJFUAT.BZ_DATA_REDPACACT_HIS his
-                        WHERE his.CHANNELNO = src.CHANNELNO
-                          AND his.OTHERID = src.OTHERID
-                          AND his.OTHERACTNO = src.OTHERACTNO
-                   )';
+            (HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO, OTHERACTNO,
+             SENDSTATUS, DATADATE, CREATEDATE)
+            SELECT HCNO, REDID, OTHERDESC, OTHERID, CHANNELNO, OTHERACTNO,
+                   ''1'', ''' || l_accdate || ''', ''' || v_today || '''
+            FROM tmp_limit_checked src
+            WHERE personal_ok = ''Y'' AND total_ok = ''Y''
+              AND NOT EXISTS (
+                  SELECT 1 FROM ZHJFUAT.BZ_DATA_REDPACACT_HIS his
+                  WHERE his.CHANNELNO  = src.CHANNELNO
+                    AND his.OTHERID    = src.OTHERID
+                    AND his.OTHERACTNO = src.OTHERACTNO
+              )';
 
-        -- 7.7 清理已成功发送的待送表记录（★ 一条DELETE替代FOR LOOP）
+        -- 8.5 从 SENDING 中删除已成功处理的 DATATYPE=1 记录
         EXECUTE IMMEDIATE '
             DELETE FROM ZHJFUAT.BZ_DATA_REDPACACT_SENDING s
             WHERE EXISTS (
-                SELECT 1 FROM temp_final_ok t
-                WHERE t.HCNO = s.HCNO
+                SELECT 1 FROM tmp_limit_checked t
+                WHERE t.personal_ok = ''Y'' AND t.total_ok = ''Y''
+                  AND t.DATATYPE = 1
+                  AND t.HCNO = s.HCNO
                   AND t.REDID = s.REDID
                   AND t.OTHERID = s.OTHERID
-                  AND t.DATATYPE = 1
             )';
-
-        -- 清理temp_final_ok
-        BEGIN
-            EXECUTE IMMEDIATE 'DROP TABLE temp_final_ok';
-        EXCEPTION
-            WHEN OTHERS THEN NULL;
-        END;
     END IF;
 
-    /* ================== 步骤8：清理数据 ================== */
+    -- =================================================================
+    -- 阶段9：清理过期待送表数据
+    -- =================================================================
     IF p_day = 0 THEN
         EXECUTE IMMEDIATE 'TRUNCATE TABLE ZHJFUAT.BZ_DATA_REDPACACT_SENDING';
     ELSE
         DELETE FROM ZHJFUAT.BZ_DATA_REDPACACT_SENDING
-         WHERE CREATEDATE <= TO_CHAR(SYSDATE - p_day, 'YYYYMMDD');
+        WHERE CREATEDATE <= TO_CHAR(SYSDATE - p_day, 'YYYYMMDD');
     END IF;
 
-    /* ================== 步骤9：清理临时表 ================== */
-    BEGIN
-        EXECUTE IMMEDIATE 'DROP TABLE temp_with_redpac';
-    EXCEPTION
-        WHEN OTHERS THEN NULL;
-    END;
-    
-    BEGIN
-        EXECUTE IMMEDIATE 'DROP TABLE temp_sent_counts';
-    EXCEPTION
-        WHEN OTHERS THEN NULL;
-    END;
-
-    /* ================== 步骤10：提交事务 ================== */
+    -- =================================================================
+    -- 阶段10：提交事务 + 清理临时表
+    -- =================================================================
     COMMIT;
-    
-    /* ================== 步骤11：输出处理日志 ================== */
-    DBMS_OUTPUT.PUT_LINE('========== 批量送红包处理完成 ==========');
-    DBMS_OUTPUT.PUT_LINE('处理时间：' || v_now);
-    DBMS_OUTPUT.PUT_LINE('处理完成时间：' || v_now3);
-    DBMS_OUTPUT.PUT_LINE('批次号：' || v_batchid);
-    DBMS_OUTPUT.PUT_LINE('成功发送红包数：' || v_final_ok_count);
-    DBMS_OUTPUT.PUT_LINE('客户不存在数：' || v_no_member_count);
-    DBMS_OUTPUT.PUT_LINE('无效红包数：' || v_invalid_pac_count);
-    DBMS_OUTPUT.PUT_LINE('超出个人限制数：' || v_limit_fail_count);
-    DBMS_OUTPUT.PUT_LINE('超出红包总数限制数：' || v_maxsend_fail_count);
-    DBMS_OUTPUT.PUT_LINE('清理超过' || p_day || '天的待送表数据');
-    DBMS_OUTPUT.PUT_LINE('=========================================');
+
+    safe_drop('tmp_member_rp_stats');
+    safe_drop('tmp_pac_total_stats');
+    safe_drop('tmp_source');
+    safe_drop('tmp_limit_checked');
+
+    -- =================================================================
+    -- 阶段11：输出处理摘要
+    -- =================================================================
+    DBMS_OUTPUT.PUT_LINE('==========================================');
+    DBMS_OUTPUT.PUT_LINE('[P_BATCH_SEND_REDPAC] 处理完成 | 批次: ' || v_batchid);
+    DBMS_OUTPUT.PUT_LINE('  源数据总量:      ' || v_total_source);
+    DBMS_OUTPUT.PUT_LINE('  客户不存在:      ' || v_no_member_cnt);
+    DBMS_OUTPUT.PUT_LINE('  无效红包:        ' || v_invalid_pac_cnt);
+    DBMS_OUTPUT.PUT_LINE('  超出个人限制:    ' || v_over_limit_cnt);
+    DBMS_OUTPUT.PUT_LINE('  超出总量限制:    ' || v_over_max_cnt);
+    DBMS_OUTPUT.PUT_LINE('  成功发送:        ' || v_success_cnt);
+    DBMS_OUTPUT.PUT_LINE('  清理超过 ' || p_day || ' 天的待送表数据');
+    DBMS_OUTPUT.PUT_LINE('==========================================');
 
 EXCEPTION
-  WHEN OTHERS THEN
-  BEGIN
-    -- 清理临时表（如果存在）
-    BEGIN
-        EXECUTE IMMEDIATE 'DROP TABLE temp_with_redpac';
-    EXCEPTION
-        WHEN OTHERS THEN NULL;
-    END;
-    
-    BEGIN
-        EXECUTE IMMEDIATE 'DROP TABLE temp_sent_counts';
-    EXCEPTION
-        WHEN OTHERS THEN NULL;
-    END;
+    WHEN OTHERS THEN
+        -- 记录错误信息
+        v_error_info := 'SQLCODE=' || SQLCODE || ' | SQLERRM=' || SQLERRM || CHR(10)
+                     || 'BACKTRACE=' || DBMS_UTILITY.FORMAT_ERROR_BACKTRACE;
 
-    BEGIN
-        EXECUTE IMMEDIATE 'DROP TABLE temp_final_ok';
-    EXCEPTION
-        WHEN OTHERS THEN NULL;
-    END;
+        -- 清理所有临时表
+        safe_drop('tmp_member_rp_stats');
+        safe_drop('tmp_pac_total_stats');
+        safe_drop('tmp_source');
+        safe_drop('tmp_limit_checked');
 
-    BEGIN
-        EXECUTE IMMEDIATE 'DROP TABLE temp_no_member';
-    EXCEPTION
-        WHEN OTHERS THEN NULL;
-    END;
+        ROLLBACK;
 
-    ROLLBACK;
-    v_errorInfo := DBMS_UTILITY.FORMAT_ERROR_BACKTRACE||' ** '||SQLCODE||' ** '||SQLERRM;
-    v_sql := 'insert into t_proc_oper_log(PROCNAME,execresult,errorinfo,createtime,datadate)
-    values(''P_BATCH_SEND_REDPAC'',''N'','''||v_errorInfo||''',TO_char(sysdate,''yyyy-mm-dd hh24:mi:ss''),'''||v_today||''')';
-    EXECUTE IMMEDIATE v_sql;
-    DBMS_OUTPUT.put_line(v_errorInfo);
-    COMMIT;
-  END;
+        -- 写入错误日志（对单引号做转义）
+        EXECUTE IMMEDIATE '
+            INSERT INTO t_proc_oper_log(PROCNAME, execresult, errorinfo, createtime, datadate)
+            VALUES(''P_BATCH_SEND_REDPAC'', ''N'', '''
+                || REPLACE(v_error_info, '''', '''''') || ''',
+                TO_CHAR(SYSDATE, ''YYYY-MM-DD HH24:MI:SS''),
+                ''' || v_today || ''')';
+
+        COMMIT;
+
+        DBMS_OUTPUT.PUT_LINE('[P_BATCH_SEND_REDPAC] 异常: ' || v_error_info);
+        RAISE;
 END P_BATCH_SEND_REDPAC;
